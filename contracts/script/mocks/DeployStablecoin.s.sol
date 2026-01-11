@@ -5,8 +5,8 @@ import {Script} from "forge-std/Script.sol";
 import {Stablecoin} from "../../src/Mocks/Stablecoin.sol";
 
 contract DeployStablecoin is Script {
-    function run() external returns (Stablecoin) {
-        Stablecoin stablecoin = deployCustomERC20("Stablecoin", "STBL", 18);
+    function run() external returns (address) {
+        address stablecoin = deployCustomERC20("Stablecoin", "STBL", 18);
         return stablecoin;
     }
 
@@ -14,10 +14,10 @@ contract DeployStablecoin is Script {
         string memory name,
         string memory symbol,
         uint8 decimals
-    ) public returns (Stablecoin) {
+    ) public returns (address) {
         vm.startBroadcast();
         Stablecoin stablecoin = new Stablecoin(name, symbol, decimals);
         vm.stopBroadcast();
-        return stablecoin;
+        return address(stablecoin);
     }
 }
