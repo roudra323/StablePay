@@ -15,6 +15,12 @@ contract StabelCoinVault is Ownable {
         bytes32 indexed refId
     );
 
+    event AllowedStablecoin(
+        address indexed tokenAddress,
+        uint256 timestamp,
+        address owner
+    );
+
     error InvalidAmount();
     error TokenNotAllowed();
     error TransferError();
@@ -28,6 +34,7 @@ contract StabelCoinVault is Ownable {
             revert InvalidAddress();
         }
         allowedStablecoins[_stableAddr] = true;
+        emit AllowedStablecoin(_stableAddr, block.timestamp, msg.sender);
     }
 
     function deposit(
