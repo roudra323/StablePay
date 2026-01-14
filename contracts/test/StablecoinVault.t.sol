@@ -15,6 +15,13 @@ contract StablecoinVaultTest is Test {
 
     error OwnableUnauthorizedAccount(address account);
 
+    event Deposited(
+        address indexed tokenAddress,
+        address indexed user,
+        uint256 amount,
+        bytes32 indexed refId
+    );
+
     function setUp() public {
         vault = new DeployStablecoinVault().deployVault(VAULT_OWNER);
         baseStablecoin = new DeployStablecoin().run();
@@ -96,5 +103,65 @@ contract StablecoinVaultTest is Test {
         vm.expectRevert("DuplicateReferenceId()");
         vm.prank(USER);
         vault.deposit(baseStablecoin, 50, referenceId);
+    }
+
+    function testDepositEmitsEventWithCorrectAmount() public {
+        bytes32 referenceId = bytes32("event_test_ref");
+        uint256 depositAmount = 500;
+        depositHelper(baseStablecoin, depositAmount, USER);
+
+        vm.expectEmit(true, true, true, true);
+        emit Deposited(baseStablecoin, USER, depositAmount, referenceId);
+
+        vm.prank(USER);
+        vault.deposit(baseStablecoin, depositAmount, referenceId);
+    }
+
+    function testDepositEmitsEventWithCorrectTokenAddress() public {
+        bytes32 referenceId = bytes32("token_event_ref");
+        uint256 depositAmount = 250;
+        depositHelper(baseStablecoin, depositAmount, USER);
+
+        vm.expectEmit(true, false, false, false);
+        emit Deposited(baseStablecoin, address(0), 0, bytes32(0));
+
+        vm.prank(USER);
+        vault.deposit(baseStablecoin, depositAmount, referenceId);
+    }
+
+    function testDepositEmitsEventWithCorrectUser() public {
+        bytes32 referenceId = bytes32("user_event_ref");
+        uint256 depositAmount = 300;
+        depositHelper(baseStablecoin, depositAmount, USER);
+
+        vm.expectEmit(false, true, false, false);
+        emit Deposited(address(0), USER, 0, bytes32(0));
+
+        vm.prank(USER);
+        vault.deposit(baseStablecoin, depositAmount, referenceId);
+    }
+
+    function testDepositEmitsEventWithCorrectReferenceId() public {
+        bytes32 referenceId = bytes32("ref_id_event_test");
+        uint256 depositAmount = 100;
+        depositHelper(baseStablecoin, depositAmount, USER);
+
+        vm.expectEmit(false, false, true, false);
+        emit Deposited(address(0), address(0), 0, referenceId);
+
+        vm.prank(USER);
+        vault.deposit(baseStablecoin, depositAmount, referenceId);
+    }
+
+    function testDepositEmitsEventWithVariousAmounts(uint256 _amount) public {
+        vm.assume(_amount > 0 && _amount < type(uint128).max);
+        bytes32 referenceId = keccak256(abi.encodePacked(_amount));
+        depositHelper(baseStablecoin, _amount, USER);
+
+        vm.expectEmit(true, true, true, true);
+        emit Deposited(baseStablecoin, USER, _amount, referenceId);
+
+        vm.prank(USER);
+        vault.deposit(baseStablecoin, _amount, referenceId);
     }
 }
