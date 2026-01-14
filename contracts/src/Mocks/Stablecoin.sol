@@ -13,7 +13,7 @@ contract Stablecoin is ERC20 {
         STABLECOIN_DECIMALS = stablecoinDecimals;
     }
 
-    function mint(address to, uint256 amount) external {
+    function mint(address to, uint256 amount) public {
         _mint(to, amount * 10 ** decimals());
     }
 
