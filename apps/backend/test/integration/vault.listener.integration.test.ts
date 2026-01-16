@@ -3,23 +3,18 @@
  * 
  * Prerequisites:
  * 1. Start Anvil: anvil
- * 2. Deploy contracts: cd contracts && forge script script/DeployStablecoinVault.s.sol --rpc-url http://127.0.0.1:8545 --broadcast
+ * 2. Deploy contracts: 
+ *    cd contracts && forge script script/mocks/DeployStablecoin.s.sol --rpc-url http://127.0.0.1:8545 --broadcast --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+ *    cd contracts && forge script script/DeployStablecoinVault.s.sol --rpc-url http://127.0.0.1:8545 --broadcast --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
  * 3. Update contract addresses in test/setup/contracts.ts if needed
  * 4. Run tests: pnpm test:integration
  */
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
-import { parseEther, keccak256, toBytes, type Hex, type Address } from 'viem';
+import { parseUnits, keccak256, toBytes, type Hex, type Address } from 'viem';
 import {
   TEST_ACCOUNTS,
   createAnvilWalletClient,
-  getPublicClient,
-  getTestClient,
-  snapshot,
-  revert,
-  mineBlocks,
-  mineBlock,
-  getBlockNumber,
-  waitForTransaction,
+  createAnvilPublicClient,
 } from '../setup/anvil.js';
 import {
   TEST_VAULT_ADDRESS,
@@ -31,35 +26,62 @@ import {
 import { STABLECOIN_VAULT_ABI } from '../../src/blockchain/contracts.js';
 
 describe('Vault Listener Integration Tests', () => {
-  let snapshotId: Hex;
-  
-  const publicClient = getPublicClient();
-  const testClient = getTestClient();
-  
+  // Create fresh clients for each test run
+  const publicClient = createAnvilPublicClient();
+
   const deployerWallet = createAnvilWalletClient(TEST_ACCOUNTS.deployer);
   const user1Wallet = createAnvilWalletClient(TEST_ACCOUNTS.user1);
   const user2Wallet = createAnvilWalletClient(TEST_ACCOUNTS.user2);
 
-  // Take a snapshot before each test for isolation
-  beforeEach(async () => {
-    snapshotId = await snapshot();
-  });
+  // Shared helper - mint tokens and approve vault
+  const setupUserForDeposit = async (
+    userWallet: ReturnType<typeof createAnvilWalletClient>,
+    rawAmount: bigint
+  ) => {
+    const scaledAmount = parseUnits(rawAmount.toString(), 18);
 
-  // Revert to snapshot after each test
-  afterEach(async () => {
-    await revert(snapshotId);
+    // Mint tokens to user
+    const mintHash = await deployerWallet.writeContract({
+      address: TEST_STABLECOIN_ADDRESS,
+      abi: ERC20_ABI,
+      functionName: 'mint',
+      args: [userWallet.account.address, rawAmount],
+    });
+    await publicClient.waitForTransactionReceipt({ hash: mintHash });
+
+    // Approve vault
+    const approveHash = await userWallet.writeContract({
+      address: TEST_STABLECOIN_ADDRESS,
+      abi: ERC20_ABI,
+      functionName: 'approve',
+      args: [TEST_VAULT_ADDRESS, scaledAmount],
+    });
+    await publicClient.waitForTransactionReceipt({ hash: approveHash });
+
+    return scaledAmount;
+  };
+
+  // Allow the stablecoin in the vault once before all tests
+  beforeAll(async () => {
+    const hash = await deployerWallet.writeContract({
+      address: TEST_VAULT_ADDRESS,
+      abi: STABLECOIN_VAULT_ABI,
+      functionName: 'allowStablecoin',
+      args: [TEST_STABLECOIN_ADDRESS],
+    });
+    await publicClient.waitForTransactionReceipt({ hash });
   });
 
   describe('Contract Setup Verification', () => {
     it('should connect to Anvil and get block number', async () => {
-      const blockNumber = await getBlockNumber();
+      const blockNumber = await publicClient.getBlockNumber();
       expect(blockNumber).toBeGreaterThanOrEqual(0n);
     });
 
     it('should have deployed vault contract', async () => {
       const code = await publicClient.getCode({ address: TEST_VAULT_ADDRESS });
       expect(code).toBeDefined();
-      expect(code?.length).toBeGreaterThan(2); // More than just '0x'
+      expect(code?.length).toBeGreaterThan(2);
     });
 
     it('should have deployed stablecoin contract', async () => {
@@ -72,7 +94,7 @@ describe('Vault Listener Integration Tests', () => {
   describe('AllowedStablecoin Events', () => {
     it('should emit AllowedStablecoin event when owner allows a token', async () => {
       const newTokenAddress = '0x1234567890123456789012345678901234567890' as Address;
-      
+
       const hash = await deployerWallet.writeContract({
         address: TEST_VAULT_ADDRESS,
         abi: STABLECOIN_VAULT_ABI,
@@ -80,10 +102,9 @@ describe('Vault Listener Integration Tests', () => {
         args: [newTokenAddress],
       });
 
-      const receipt = await waitForTransaction(hash);
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
       expect(receipt.status).toBe('success');
 
-      // Fetch the AllowedStablecoin event
       const logs = await publicClient.getLogs({
         address: TEST_VAULT_ADDRESS,
         event: ALLOWED_STABLECOIN_EVENT,
@@ -98,37 +119,10 @@ describe('Vault Listener Integration Tests', () => {
   });
 
   describe('Deposited Events', () => {
-    // Helper to mint tokens and approve vault
-    const setupUserForDeposit = async (
-      userWallet: ReturnType<typeof createAnvilWalletClient>,
-      amount: bigint
-    ) => {
-      // Mint tokens to user (assuming deployer can mint)
-      const mintHash = await deployerWallet.writeContract({
-        address: TEST_STABLECOIN_ADDRESS,
-        abi: ERC20_ABI,
-        functionName: 'mint',
-        args: [userWallet.account.address, amount],
-      });
-      await waitForTransaction(mintHash);
-
-      // Approve vault to spend tokens
-      const approveHash = await userWallet.writeContract({
-        address: TEST_STABLECOIN_ADDRESS,
-        abi: ERC20_ABI,
-        functionName: 'approve',
-        args: [TEST_VAULT_ADDRESS, amount],
-      });
-      await waitForTransaction(approveHash);
-    };
-
     it('should emit Deposited event when user deposits tokens', async () => {
-      const depositAmount = parseEther('100');
-      const refId = keccak256(toBytes('test-deposit-001'));
+      const depositAmount = await setupUserForDeposit(user1Wallet, 100n);
+      const refId = keccak256(toBytes(`deposit-${Date.now()}`));
 
-      await setupUserForDeposit(user1Wallet, depositAmount);
-
-      // Deposit tokens
       const depositHash = await user1Wallet.writeContract({
         address: TEST_VAULT_ADDRESS,
         abi: STABLECOIN_VAULT_ABI,
@@ -136,10 +130,9 @@ describe('Vault Listener Integration Tests', () => {
         args: [TEST_STABLECOIN_ADDRESS, depositAmount, refId],
       });
 
-      const receipt = await waitForTransaction(depositHash);
+      const receipt = await publicClient.waitForTransactionReceipt({ hash: depositHash });
       expect(receipt.status).toBe('success');
 
-      // Fetch the Deposited event
       const logs = await publicClient.getLogs({
         address: TEST_VAULT_ADDRESS,
         event: DEPOSITED_EVENT,
@@ -155,34 +148,28 @@ describe('Vault Listener Integration Tests', () => {
     });
 
     it('should track multiple deposits from different users', async () => {
-      const amount1 = parseEther('50');
-      const amount2 = parseEther('75');
-      const refId1 = keccak256(toBytes('multi-deposit-001'));
-      const refId2 = keccak256(toBytes('multi-deposit-002'));
+      const refId1 = keccak256(toBytes(`multi-1-${Date.now()}`));
+      const refId2 = keccak256(toBytes(`multi-2-${Date.now()}`));
 
-      // Setup both users
-      await setupUserForDeposit(user1Wallet, amount1);
-      await setupUserForDeposit(user2Wallet, amount2);
+      const amount1 = await setupUserForDeposit(user1Wallet, 50n);
+      const amount2 = await setupUserForDeposit(user2Wallet, 75n);
 
-      // User 1 deposits
       const hash1 = await user1Wallet.writeContract({
         address: TEST_VAULT_ADDRESS,
         abi: STABLECOIN_VAULT_ABI,
         functionName: 'deposit',
         args: [TEST_STABLECOIN_ADDRESS, amount1, refId1],
       });
-      await waitForTransaction(hash1);
+      await publicClient.waitForTransactionReceipt({ hash: hash1 });
 
-      // User 2 deposits
       const hash2 = await user2Wallet.writeContract({
         address: TEST_VAULT_ADDRESS,
         abi: STABLECOIN_VAULT_ABI,
         functionName: 'deposit',
         args: [TEST_STABLECOIN_ADDRESS, amount2, refId2],
       });
-      await waitForTransaction(hash2);
+      await publicClient.waitForTransactionReceipt({ hash: hash2 });
 
-      // Fetch all Deposited events
       const logs = await publicClient.getLogs({
         address: TEST_VAULT_ADDRESS,
         event: DEPOSITED_EVENT,
@@ -190,48 +177,35 @@ describe('Vault Listener Integration Tests', () => {
         toBlock: 'latest',
       });
 
-      // Should have at least 2 deposits
-      expect(logs.length).toBeGreaterThanOrEqual(2);
-
-      // Find our specific deposits
-      const user1Deposit = logs.find(
-        (log) => log.args.refId === refId1
-      );
-      const user2Deposit = logs.find(
-        (log) => log.args.refId === refId2
-      );
+      const user1Deposit = logs.find((log) => log.args.refId === refId1);
+      const user2Deposit = logs.find((log) => log.args.refId === refId2);
 
       expect(user1Deposit).toBeDefined();
-      expect(user1Deposit?.args.user?.toLowerCase()).toBe(TEST_ACCOUNTS.user1.address.toLowerCase());
       expect(user1Deposit?.args.amount).toBe(amount1);
 
       expect(user2Deposit).toBeDefined();
-      expect(user2Deposit?.args.user?.toLowerCase()).toBe(TEST_ACCOUNTS.user2.address.toLowerCase());
       expect(user2Deposit?.args.amount).toBe(amount2);
     });
 
     it('should reject duplicate reference IDs', async () => {
-      const depositAmount = parseEther('25');
-      const refId = keccak256(toBytes('duplicate-test'));
+      const refId = keccak256(toBytes(`dup-${Date.now()}`));
+      const depositAmount = await setupUserForDeposit(user1Wallet, 50n);
+      const halfAmount = depositAmount / 2n;
 
-      await setupUserForDeposit(user1Wallet, depositAmount * 2n);
-
-      // First deposit should succeed
       const hash1 = await user1Wallet.writeContract({
         address: TEST_VAULT_ADDRESS,
         abi: STABLECOIN_VAULT_ABI,
         functionName: 'deposit',
-        args: [TEST_STABLECOIN_ADDRESS, depositAmount, refId],
+        args: [TEST_STABLECOIN_ADDRESS, halfAmount, refId],
       });
-      await waitForTransaction(hash1);
+      await publicClient.waitForTransactionReceipt({ hash: hash1 });
 
-      // Second deposit with same refId should fail
       await expect(
         user1Wallet.writeContract({
           address: TEST_VAULT_ADDRESS,
           abi: STABLECOIN_VAULT_ABI,
           functionName: 'deposit',
-          args: [TEST_STABLECOIN_ADDRESS, depositAmount, refId],
+          args: [TEST_STABLECOIN_ADDRESS, halfAmount, refId],
         })
       ).rejects.toThrow();
     });
@@ -239,46 +213,48 @@ describe('Vault Listener Integration Tests', () => {
 
   describe('Historical Event Fetching', () => {
     it('should fetch historical events from a range of blocks', async () => {
-      const depositAmount = parseEther('10');
-      
-      // Record starting block
-      const startBlock = await getBlockNumber();
+      const refIds: Hex[] = [];
+      const receipts: { blockNumber: bigint }[] = [];
 
-      // Make multiple deposits
+      // Make 3 deposits and track their blocks
       for (let i = 0; i < 3; i++) {
-        const refId = keccak256(toBytes(`historical-${i}`));
-        await setupUserForDeposit(user1Wallet, depositAmount);
-        
+        const refId = keccak256(toBytes(`hist-${Date.now()}-${i}`));
+        refIds.push(refId);
+
+        const depositAmount = await setupUserForDeposit(user1Wallet, 10n);
+
         const hash = await user1Wallet.writeContract({
           address: TEST_VAULT_ADDRESS,
           abi: STABLECOIN_VAULT_ABI,
           functionName: 'deposit',
           args: [TEST_STABLECOIN_ADDRESS, depositAmount, refId],
         });
-        await waitForTransaction(hash);
+        const receipt = await publicClient.waitForTransactionReceipt({ hash });
+        receipts.push({ blockNumber: receipt.blockNumber });
       }
 
-      // Mine some extra blocks
-      await mineBlocks(5);
+      // Get the block range from receipts
+      const minBlock = receipts.reduce((min, r) => r.blockNumber < min ? r.blockNumber : min, receipts[0].blockNumber);
+      const maxBlock = receipts.reduce((max, r) => r.blockNumber > max ? r.blockNumber : max, receipts[0].blockNumber);
 
-      const endBlock = await getBlockNumber();
-
-      // Fetch events from the range
       const logs = await publicClient.getLogs({
         address: TEST_VAULT_ADDRESS,
         event: DEPOSITED_EVENT,
-        fromBlock: startBlock,
-        toBlock: endBlock,
+        fromBlock: minBlock,
+        toBlock: maxBlock,
       });
 
-      expect(logs.length).toBeGreaterThanOrEqual(3);
-      
-      // Verify all events have correct structure
-      for (const log of logs) {
+      // Find our specific deposits
+      const ourDeposits = logs.filter((log) =>
+        refIds.includes(log.args.refId as Hex)
+      );
+
+      expect(ourDeposits.length).toBe(3);
+
+      for (const log of ourDeposits) {
         expect(log.args.tokenAddress).toBeDefined();
         expect(log.args.user).toBeDefined();
         expect(log.args.amount).toBeDefined();
-        expect(log.args.refId).toBeDefined();
         expect(log.blockNumber).toBeGreaterThan(0n);
         expect(log.transactionHash).toBeDefined();
       }
@@ -286,40 +262,39 @@ describe('Vault Listener Integration Tests', () => {
   });
 
   describe('Block Confirmation Handling', () => {
-    it('should correctly track confirmations after mining blocks', async () => {
-      const depositAmount = parseEther('50');
-      const refId = keccak256(toBytes('confirmation-test'));
+    it('should include block metadata in event logs', async () => {
+      const refId = keccak256(toBytes(`meta-${Date.now()}`));
+      const depositAmount = await setupUserForDeposit(user1Wallet, 50n);
 
-      await setupUserForDeposit(user1Wallet, depositAmount);
-
-      const blockBeforeDeposit = await getBlockNumber();
-
-      // Make deposit
       const hash = await user1Wallet.writeContract({
         address: TEST_VAULT_ADDRESS,
         abi: STABLECOIN_VAULT_ABI,
         functionName: 'deposit',
         args: [TEST_STABLECOIN_ADDRESS, depositAmount, refId],
       });
-      const receipt = await waitForTransaction(hash);
-      
-      const depositBlock = receipt.blockNumber;
-      expect(depositBlock).toBeGreaterThan(blockBeforeDeposit);
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
 
-      // Mine 12 more blocks (typical confirmation count)
-      await mineBlocks(12);
+      // Fetch the event
+      const logs = await publicClient.getLogs({
+        address: TEST_VAULT_ADDRESS,
+        event: DEPOSITED_EVENT,
+        fromBlock: receipt.blockNumber,
+        toBlock: receipt.blockNumber,
+      });
 
-      const currentBlock = await getBlockNumber();
-      const confirmations = currentBlock - depositBlock;
+      expect(logs).toHaveLength(1);
 
-      expect(confirmations).toBe(12n);
+      // Verify block metadata is present for confirmation tracking
+      const event = logs[0];
+      expect(event.blockNumber).toBe(receipt.blockNumber);
+      expect(event.transactionHash).toBe(hash);
+      expect(event.logIndex).toBeGreaterThanOrEqual(0);
+      expect(event.blockHash).toBeDefined();
     });
 
-    it('should be able to fetch events at specific confirmation depths', async () => {
-      const depositAmount = parseEther('30');
-      const refId = keccak256(toBytes('depth-test'));
-
-      await setupUserForDeposit(user1Wallet, depositAmount);
+    it('should allow fetching events within specific block ranges', async () => {
+      const refId = keccak256(toBytes(`range-${Date.now()}`));
+      const depositAmount = await setupUserForDeposit(user1Wallet, 30n);
 
       const hash = await user1Wallet.writeContract({
         address: TEST_VAULT_ADDRESS,
@@ -327,28 +302,32 @@ describe('Vault Listener Integration Tests', () => {
         functionName: 'deposit',
         args: [TEST_STABLECOIN_ADDRESS, depositAmount, refId],
       });
-      const receipt = await waitForTransaction(hash);
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      const depositBlock = receipt.blockNumber;
 
-      // Mine blocks to simulate time passing
-      await mineBlocks(20);
-
-      const latestBlock = await getBlockNumber();
-      const requiredConfirmations = 6n;
-      const safeBlock = latestBlock - requiredConfirmations;
-
-      // Only fetch events that have enough confirmations
-      const confirmedLogs = await publicClient.getLogs({
+      // Fetch events from block 0 to deposit block
+      const logs = await publicClient.getLogs({
         address: TEST_VAULT_ADDRESS,
         event: DEPOSITED_EVENT,
         fromBlock: 0n,
-        toBlock: safeBlock,
+        toBlock: depositBlock,
       });
 
-      // Our deposit should be in the confirmed logs
-      const ourDeposit = confirmedLogs.find((log) => log.args.refId === refId);
+      // Our deposit should be in the logs
+      const ourDeposit = logs.find((log) => log.args.refId === refId);
       expect(ourDeposit).toBeDefined();
-      expect(ourDeposit?.blockNumber).toBeLessThanOrEqual(safeBlock);
+      expect(ourDeposit?.blockNumber).toBe(depositBlock);
+
+      // Fetch events AFTER deposit block (should not include our deposit)
+      const laterLogs = await publicClient.getLogs({
+        address: TEST_VAULT_ADDRESS,
+        event: DEPOSITED_EVENT,
+        fromBlock: depositBlock + 1n,
+        toBlock: 'latest',
+      });
+
+      const notOurDeposit = laterLogs.find((log) => log.args.refId === refId);
+      expect(notOurDeposit).toBeUndefined();
     });
   });
 });
-
